@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.error
+mods/space-status/status.json
+mods/space-status/.status-*
+mods/*/jsconfig.json
+mods/*/*.d.ts
