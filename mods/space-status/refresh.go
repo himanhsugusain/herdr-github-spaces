@@ -7,17 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/google/go-github/v72/github"
 )
 
 const pollInterval = 60 * time.Second
-const commandTimeout = 45 * time.Second
-
-type pullRequest struct {
-	Number  int    `json:"number"`
-	HeadRef string `json:"headRefName"`
-	State   string `json:"state"`
-	IsDraft bool   `json:"isDraft"`
-}
 
 type statusRecord struct {
 	Repository string `json:"repository"`
@@ -43,10 +37,12 @@ func runRefresh(args []string) error {
 	fs := newFlagSet("refresh")
 	repoFlag := fs.String("repo", ".", "Local Git checkout whose worktrees to monitor")
 	outputFlag := fs.String("output", filepath.Join(executableDir(), "status.json"), "Status JSON output path")
+	tokenFlag := fs.String("token", "", "GitHub personal-access token (default: GITHUB_TOKEN env)")
 	once := fs.Bool("once", false, "Refresh once and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
 	root, err := absolutePath(*repoFlag)
 	if err != nil {
 		return err
@@ -59,7 +55,25 @@ func runRefresh(args []string) error {
 	if err != nil {
 		return err
 	}
-	refresh := func() error { return refreshOnce(root, out) }
+
+	token, err := resolveToken(*tokenFlag)
+	if err != nil {
+		return err
+	}
+	gh := newGitHubClient(token)
+
+	owner, repo, err := repoFromRemote(root)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	username, err := githubUser(ctx, gh)
+	if err != nil {
+		return err
+	}
+
+	refresh := func() error { return refreshOnce(ctx, root, out, gh, owner, repo, username) }
 	if *once {
 		return refresh()
 	}
@@ -74,12 +88,12 @@ func runRefresh(args []string) error {
 	}
 }
 
-func refreshOnce(root, out string) error {
+func refreshOnce(ctx context.Context, root, out string, gh *github.Client, owner, repo, username string) error {
 	paths, err := worktrees(root)
 	if err != nil {
 		return err
 	}
-	prs := pullRequests(paths, root)
+	prs := pullRequests(ctx, gh, owner, repo, username, paths)
 	payload := map[string]any{"prs": prs}
 	data, err := jsonText(payload, false)
 	if err != nil {
@@ -120,101 +134,58 @@ func branch(cwd string) string {
 	return strings.TrimSpace(string(stdout))
 }
 
-func ghJSON(root string, args ...string) ([]byte, error) {
-	stdout, stderr, err := command(context.Background(), root, commandTimeout, args...)
-	if err != nil {
-		return nil, commandError(args, stdout, stderr, err)
-	}
-	return stdout, nil
-}
-
-func pullRequests(paths []string, root string) map[string]any {
-	listed, err := ghJSON(root, "gh", "pr", "list", "--author", "@me", "--state", "open", "--limit", "40", "--json", "number,headRefName,state,isDraft")
+func pullRequests(ctx context.Context, gh *github.Client, owner, repo, username string, paths []string) map[string]any {
+	open, err := listPRsByAuthor(ctx, gh, owner, repo, username, "open", 40)
 	if err != nil {
 		return map[string]any{}
 	}
-	var open []pullRequest
-	if decodeJSON(listed, &open) != nil {
-		return map[string]any{}
-	}
-	byBranch := make(map[string]pullRequest, len(open))
+	byBranch := make(map[string]*github.PullRequest, len(open))
 	for _, pr := range open {
-		byBranch[pr.HeadRef] = pr
+		byBranch[pr.GetHead().GetRef()] = pr
 	}
-	if recentData, recentErr := ghJSON(root, "gh", "pr", "list", "--author", "@me", "--state", "all", "--limit", "100", "--json", "number,headRefName,state,isDraft"); recentErr == nil {
-		var recent []pullRequest
-		if decodeJSON(recentData, &recent) == nil {
-			for _, pr := range recent {
-				if _, exists := byBranch[pr.HeadRef]; !exists {
-					byBranch[pr.HeadRef] = pr
-				}
+
+	if recent, err := listPRsByAuthor(ctx, gh, owner, repo, username, "all", 100); err == nil {
+		for _, pr := range recent {
+			ref := pr.GetHead().GetRef()
+			if _, exists := byBranch[ref]; !exists {
+				byBranch[ref] = pr
 			}
 		}
 	}
-	repoData, err := ghJSON(root, "gh", "repo", "view", "--json", "nameWithOwner")
-	if err != nil {
-		return map[string]any{}
-	}
-	var repo struct {
-		NameWithOwner string `json:"nameWithOwner"`
-	}
-	if decodeJSON(repoData, &repo) != nil {
-		return map[string]any{}
-	}
-	parts := strings.SplitN(repo.NameWithOwner, "/", 2)
-	if len(parts) != 2 {
-		return map[string]any{}
-	}
+
+	nameWithOwner := owner + "/" + repo
 
 	type match struct {
 		cwd  string
 		head string
-		pr   *pullRequest
+		pr   *github.PullRequest
 	}
 	matches := make([]match, 0, len(paths))
-	numbers := make([]int, 0)
+	refs := make(map[int]string) // PR number → head SHA
 	seenNumbers := make(map[int]bool)
+
 	for _, cwd := range paths {
 		head := branch(cwd)
-		pr, found := byBranch[head]
-		var matched *pullRequest
-		if found && head != "" {
-			copy := pr
-			matched = &copy
-			if !seenNumbers[pr.Number] {
-				seenNumbers[pr.Number] = true
-				numbers = append(numbers, pr.Number)
+		pr := byBranch[head]
+		if pr != nil && head != "" {
+			n := pr.GetNumber()
+			if !seenNumbers[n] {
+				seenNumbers[n] = true
+				refs[n] = pr.GetHead().GetSHA()
 			}
 		}
-		matches = append(matches, match{cwd: cwd, head: head, pr: matched})
+		matches = append(matches, match{cwd: cwd, head: head, pr: pr})
 	}
+
 	ci := make(map[int]checkTally)
-	if len(numbers) > 0 {
-		fields := make([]string, 0, len(numbers))
-		for _, number := range numbers {
-			fields = append(fields, fmt.Sprintf("n%d: pullRequest(number: %d) { commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ... on CheckRun { conclusion status } ... on StatusContext { state } } } } } } } }", number, number))
-		}
-		query := fmt.Sprintf(`query { repository(owner: %q, name: %q) { %s } }`, parts[0], parts[1], strings.Join(fields, " "))
-		if data, queryErr := ghJSON(root, "gh", "api", "graphql", "-f", "query="+query); queryErr == nil {
-			var response map[string]any
-			if decodeJSON(data, &response) == nil {
-				body := object(object(response["data"])["repository"])
-				for _, number := range numbers {
-					pr := object(body[fmt.Sprintf("n%d", number)])
-					commits := list(object(pr["commits"])["nodes"])
-					var contexts []any
-					if len(commits) > 0 {
-						commit := object(commits[0])["commit"]
-						contexts = list(object(object(commit)["statusCheckRollup"])["contexts"])
-						if len(contexts) == 0 {
-							contexts = list(object(object(object(commit)["statusCheckRollup"])["contexts"])["nodes"])
-						}
-					}
-					ci[number] = tallyChecks(contexts)
-				}
-			}
+	for n, ref := range refs {
+		r := fetchCI(ctx, gh, owner, repo, ref)
+		ci[n] = checkTally{
+			Failed: r.Failed, Pending: r.Pending,
+			Passed: r.Passed, Skipped: r.Skipped, Total: r.Total,
 		}
 	}
+
 	result := make(map[string]any, len(matches))
 	for _, item := range matches {
 		keyBytes, _ := jsonText([]any{nil, item.cwd, item.head}, false)
@@ -223,12 +194,12 @@ func pullRequests(paths []string, root string) map[string]any {
 			result[key] = nil
 			continue
 		}
-		counts := ci[item.pr.Number]
+		counts := ci[item.pr.GetNumber()]
 		result[key] = statusRecord{
-			Repository: repo.NameWithOwner,
-			Number:     item.pr.Number,
-			State:      item.pr.State,
-			IsDraft:    item.pr.IsDraft,
+			Repository: nameWithOwner,
+			Number:     item.pr.GetNumber(),
+			State:      prStateName(item.pr),
+			IsDraft:    item.pr.GetDraft(),
 			Failed:     counts.Failed,
 			Pending:    counts.Pending,
 			Passed:     counts.Passed,
@@ -237,37 +208,4 @@ func pullRequests(paths []string, root string) map[string]any {
 		}
 	}
 	return result
-}
-
-func tallyChecks(nodes []any) checkTally {
-	var tally checkTally
-	tally.Total = len(nodes)
-	for _, raw := range nodes {
-		node := object(raw)
-		conclusion := text(node["conclusion"])
-		status := text(node["status"])
-		if status == "" {
-			status = text(node["state"])
-		}
-		switch {
-		case contains([]string{"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE"}, conclusion) || contains([]string{"FAILURE", "ERROR"}, status):
-			tally.Failed++
-		case conclusion == "SKIPPED":
-			tally.Skipped++
-		case contains([]string{"SUCCESS", "NEUTRAL"}, conclusion) || status == "SUCCESS":
-			tally.Passed++
-		default:
-			tally.Pending++
-		}
-	}
-	return tally
-}
-
-func contains(items []string, value string) bool {
-	for _, item := range items {
-		if item == value {
-			return true
-		}
-	}
-	return false
 }

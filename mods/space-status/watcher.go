@@ -7,16 +7,19 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/google/go-github/v72/github"
 )
 
 const (
 	watchInterval = 60 * time.Second
 	bodyLimit     = 700
 )
+
+// ---------- flag helpers ----------
 
 type stringList []string
 
@@ -26,35 +29,80 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
+// ---------- typed snapshot structs ----------
+
+type prSnapshot struct {
+	Number      int        `json:"number"`
+	Title       string     `json:"title"`
+	URL         string     `json:"url"`
+	Fingerprint snapshotFP `json:"fingerprint"`
+}
+
+type snapshotFP struct {
+	Head      string       `json:"head"`
+	State     string       `json:"state"`
+	Mergeable string       `json:"mergeable"`
+	Decision  string       `json:"decision"`
+	Draft     bool         `json:"draft"`
+	Checks    ciDetail     `json:"checks"`
+	Comments  []noteRecord `json:"comments"`
+	Reviews   []noteRecord `json:"reviews"`
+	Inline    []noteRecord `json:"inline"`
+}
+
+type ciDetail struct {
+	Failed  []string `json:"failed"`
+	Pending int      `json:"pending"`
+	Passed  int      `json:"passed"`
+}
+
+type noteRecord struct {
+	ID     string `json:"id"`
+	Author string `json:"author"`
+	At     string `json:"at"`
+	State  string `json:"state,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Body   string `json:"body"`
+}
+
+// ---------- watcher types ----------
+
 type watchAgent struct {
-	Address string `json:"address"`
-	CWD     string `json:"cwd"`
-	Where   string `json:"where"`
+	Address string
+	CWD     string
+	Where   string
 }
 
 type watchSlot struct {
-	PR       string         `json:"pr"`
-	Snapshot map[string]any `json:"snapshot"`
-	Pending  []string       `json:"pending"`
+	PR       string      `json:"pr"`
+	Snapshot *prSnapshot `json:"snapshot"`
+	Pending  []string    `json:"pending"`
 }
 
 type watcher struct {
-	root       string
-	githubRepo string
-	statePath  string
-	skip       map[string]bool
+	root      string
+	owner     string
+	repo      string
+	statePath string
+	skip      map[string]bool
+	gh        *github.Client
+	username  string
 }
+
+// ---------- entry point ----------
 
 func runPRWatch(args []string) error {
 	fs := newFlagSet("pr-watch")
-	repoFlag := fs.String("repo", ".", "Local repository/worktree root used for Git and gh")
-	githubRepoFlag := fs.String("github-repo", "", "GitHub repository as OWNER/NAME (inferred with gh when omitted)")
+	repoFlag := fs.String("repo", ".", "Local repository/worktree root used for Git")
+	githubRepoFlag := fs.String("github-repo", "", "GitHub repository as OWNER/NAME (inferred from git remote when omitted)")
+	tokenFlag := fs.String("token", "", "GitHub personal-access token (default: GITHUB_TOKEN env)")
 	stateFlag := fs.String("state", "", "State JSON path (default: ~/.config/herdr-app/mods/space-status/pr_watch_state.json)")
 	var skip stringList
 	fs.Var(&skip, "skip", "Agent address to skip (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
 	root, err := absolutePath(*repoFlag)
 	if err != nil {
 		return err
@@ -70,23 +118,33 @@ func runPRWatch(args []string) error {
 	if err != nil {
 		return err
 	}
-	githubRepo := strings.TrimSpace(*githubRepoFlag)
-	if githubRepo == "" {
-		data, runErr := ghJSON(root, "gh", "repo", "view", "--json", "nameWithOwner")
-		if runErr != nil {
-			return runErr
+
+	token, err := resolveToken(*tokenFlag)
+	if err != nil {
+		return err
+	}
+	gh := newGitHubClient(token)
+
+	owner, repo := "", ""
+	if r := strings.TrimSpace(*githubRepoFlag); r != "" {
+		parts := strings.SplitN(r, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return fmt.Errorf("invalid --github-repo %q: expected OWNER/NAME", r)
 		}
-		var info struct {
-			NameWithOwner string `json:"nameWithOwner"`
-		}
-		if err := decodeJSON(data, &info); err != nil {
+		owner, repo = parts[0], parts[1]
+	} else {
+		owner, repo, err = repoFromRemote(root)
+		if err != nil {
 			return err
 		}
-		githubRepo = info.NameWithOwner
 	}
-	if len(strings.Split(githubRepo, "/")) != 2 {
-		return fmt.Errorf("invalid --github-repo %q: expected OWNER/NAME", githubRepo)
+
+	ctx := context.Background()
+	username, err := githubUser(ctx, gh)
+	if err != nil {
+		return err
 	}
+
 	ignored := make(map[string]bool)
 	for _, address := range skip {
 		ignored[address] = true
@@ -94,12 +152,18 @@ func runPRWatch(args []string) error {
 	if address := os.Getenv("HC_TERMINAL_ID"); address != "" {
 		ignored[address] = true
 	}
-	w := &watcher{root: root, githubRepo: githubRepo, statePath: statePath, skip: ignored}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	w := &watcher{
+		root: root, owner: owner, repo: repo,
+		statePath: statePath, skip: ignored,
+		gh: gh, username: username,
+	}
+
+	sctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	for {
 		started := time.Now()
-		if err := w.once(ctx); err != nil {
+		if err := w.once(sctx); err != nil {
 			fmt.Fprintf(os.Stderr, "pr-watch: %v\n", err)
 		}
 		wait := watchInterval - time.Since(started)
@@ -108,7 +172,7 @@ func runPRWatch(args []string) error {
 		}
 		timer := time.NewTimer(wait)
 		select {
-		case <-ctx.Done():
+		case <-sctx.Done():
 			timer.Stop()
 			return nil
 		case <-timer.C:
@@ -116,12 +180,14 @@ func runPRWatch(args []string) error {
 	}
 }
 
+// ---------- poll loop body ----------
+
 func (w *watcher) once(ctx context.Context) error {
 	state, err := w.loadState()
 	if err != nil {
 		return err
 	}
-	agents, err := w.piAgents(ctx)
+	agents, err := w.liveAgents(ctx)
 	if err != nil {
 		return err
 	}
@@ -129,6 +195,7 @@ func (w *watcher) once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	seen := make(map[string]bool)
 	for _, agent := range agents {
 		name := branch(agent.CWD)
@@ -137,31 +204,36 @@ func (w *watcher) once(ctx context.Context) error {
 			continue
 		}
 		seen[agent.Address] = true
-		current, err := w.snapshot(ctx, pr.Number)
+		number := pr.GetNumber()
+
+		current, err := w.snapshot(ctx, number)
 		if err != nil {
 			return err
 		}
 		slot, exists := state[agent.Address]
 		if !exists || slot.Snapshot == nil {
-			state[agent.Address] = watchSlot{PR: fmt.Sprint(pr.Number), Snapshot: current}
-			fmt.Printf("pr-watch: baseline %s PR #%d\n", agent.Where, pr.Number)
+			state[agent.Address] = watchSlot{PR: fmt.Sprint(number), Snapshot: current}
+			fmt.Printf("pr-watch: baseline %s PR #%d\n", agent.Where, number)
 			continue
 		}
+
 		lines := describe(slot.Snapshot, current)
 		if len(lines) == 0 && len(slot.Pending) > 0 {
 			lines = slot.Pending
 		}
 		if len(lines) == 0 {
-			state[agent.Address] = watchSlot{PR: fmt.Sprint(pr.Number), Snapshot: current}
+			state[agent.Address] = watchSlot{PR: fmt.Sprint(number), Snapshot: current}
 			continue
 		}
+
 		if w.deliver(ctx, agent.Address, makeMessage(current, lines)) {
-			state[agent.Address] = watchSlot{PR: fmt.Sprint(pr.Number), Snapshot: current}
-			fmt.Printf("pr-watch: sent %s PR #%d (%d lines)\n", agent.Address, pr.Number, len(lines))
+			state[agent.Address] = watchSlot{PR: fmt.Sprint(number), Snapshot: current}
+			fmt.Printf("pr-watch: sent %s PR #%d (%d lines)\n", agent.Address, number, len(lines))
 		} else {
-			state[agent.Address] = watchSlot{PR: fmt.Sprint(pr.Number), Snapshot: slot.Snapshot, Pending: lines}
+			state[agent.Address] = watchSlot{PR: fmt.Sprint(number), Snapshot: slot.Snapshot, Pending: lines}
 		}
 	}
+
 	for address := range state {
 		if !seen[address] && !w.skip[address] {
 			delete(state, address)
@@ -169,6 +241,8 @@ func (w *watcher) once(ctx context.Context) error {
 	}
 	return w.saveState(state)
 }
+
+// ---------- state persistence ----------
 
 func (w *watcher) loadState() (map[string]watchSlot, error) {
 	state := make(map[string]watchSlot)
@@ -179,8 +253,9 @@ func (w *watcher) loadState() (map[string]watchSlot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := decodeJSON(data, &state); err != nil {
-		return nil, fmt.Errorf("read watcher state: %w", err)
+	// Silently discard state if the format changed (e.g. after an upgrade).
+	if decodeJSON(data, &state) != nil {
+		return make(map[string]watchSlot), nil
 	}
 	return state, nil
 }
@@ -200,249 +275,37 @@ func (w *watcher) saveState(state map[string]watchSlot) error {
 	return os.Rename(tmp, w.statePath)
 }
 
-func (w *watcher) piAgents(ctx context.Context) ([]watchAgent, error) {
+// ---------- Herdr agent discovery (hc CLI) ----------
+
+func (w *watcher) liveAgents(ctx context.Context) ([]watchAgent, error) {
 	args := []string{"hc", "ls", "--json"}
 	stdout, stderr, err := command(ctx, "", 45*time.Second, args...)
 	if err != nil {
 		return nil, commandError(args, stdout, stderr, err)
 	}
 	var response struct {
-		Terminals []map[string]any `json:"terminals"`
+		Terminals []struct {
+			Address string `json:"address"`
+			CWD     string `json:"cwd"`
+			State   string `json:"state"`
+			Where   string `json:"where"`
+		} `json:"terminals"`
 	}
 	if err := decodeJSON(stdout, &response); err != nil {
 		return nil, err
 	}
 	var agents []watchAgent
-	for _, item := range response.Terminals {
-		address, cwd := text(item["address"]), text(item["cwd"])
-		if text(item["agent"]) != "pi" || text(item["state"]) != "live" || address == "" || cwd == "" || w.skip[address] {
+	for _, t := range response.Terminals {
+		if t.State != "live" || t.Address == "" || t.CWD == "" || w.skip[t.Address] {
 			continue
 		}
-		where := text(item["where"])
+		where := t.Where
 		if where == "" {
-			where = address
+			where = t.Address
 		}
-		agents = append(agents, watchAgent{Address: address, CWD: cwd, Where: where})
+		agents = append(agents, watchAgent{Address: t.Address, CWD: t.CWD, Where: where})
 	}
 	return agents, nil
-}
-
-func (w *watcher) openPRs(ctx context.Context) (map[string]pullRequest, error) {
-	args := []string{"gh", "pr", "list", "--repo", w.githubRepo, "--author", "@me", "--state", "open", "--limit", "40", "--json", "number,headRefName,title,url"}
-	stdout, stderr, err := command(ctx, w.root, 45*time.Second, args...)
-	if err != nil {
-		return nil, commandError(args, stdout, stderr, err)
-	}
-	var prs []pullRequest
-	if err := decodeJSON(stdout, &prs); err != nil {
-		return nil, err
-	}
-	result := make(map[string]pullRequest, len(prs))
-	for _, pr := range prs {
-		result[pr.HeadRef] = pr
-	}
-	return result, nil
-}
-
-func (w *watcher) snapshot(ctx context.Context, number int) (map[string]any, error) {
-	args := []string{"gh", "pr", "view", fmt.Sprint(number), "--repo", w.githubRepo, "--json", "number,title,url,reviewDecision,isDraft,headRefOid,updatedAt,statusCheckRollup,comments,reviews"}
-	stdout, stderr, err := command(ctx, w.root, 60*time.Second, args...)
-	if err != nil {
-		return nil, commandError(args, stdout, stderr, err)
-	}
-	var pr map[string]any
-	if err := decodeJSON(stdout, &pr); err != nil {
-		return nil, err
-	}
-
-	inlineArgs := []string{"gh", "api", "--paginate", fmt.Sprintf("repos/%s/pulls/%d/comments", w.githubRepo, number), "--jq", "[.[] | {id: .id, user: .user.login, updated_at: .updated_at, body: .body, path: .path}]"}
-	inlineData, _, inlineErr := command(ctx, w.root, 60*time.Second, inlineArgs...)
-	var notes []map[string]any
-	if inlineErr == nil && len(strings.TrimSpace(string(inlineData))) > 0 {
-		_ = decodeJSON(inlineData, &notes)
-	}
-	comments := make([]map[string]any, 0)
-	for _, raw := range list(pr["comments"]) {
-		comment := object(raw)
-		author := text(object(comment["author"])["login"])
-		if author == "" {
-			author = "unknown"
-		}
-		at := comment["updatedAt"]
-		if at == nil {
-			at = comment["createdAt"]
-		}
-		comments = append(comments, map[string]any{"id": comment["id"], "author": author, "at": at, "body": clip(text(comment["body"]))})
-	}
-	reviews := make([]map[string]any, 0)
-	for _, raw := range list(pr["reviews"]) {
-		review := object(raw)
-		author := text(object(review["author"])["login"])
-		if author == "" {
-			author = "unknown"
-		}
-		reviews = append(reviews, map[string]any{"id": review["id"], "author": author, "state": review["state"], "at": review["submittedAt"], "body": clip(text(review["body"]))})
-	}
-	inline := make([]map[string]any, 0, len(notes))
-	for _, note := range notes {
-		author := text(note["user"])
-		if author == "" {
-			author = "unknown"
-		}
-		inline = append(inline, map[string]any{"id": note["id"], "author": author, "at": note["updated_at"], "path": note["path"], "body": clip(text(note["body"]))})
-	}
-	checks := tallyPRChecks(list(pr["statusCheckRollup"]))
-	fingerprint := map[string]any{
-		"head":     pr["headRefOid"],
-		"decision": stringValue(pr["reviewDecision"]),
-		"draft":    pr["isDraft"] == true,
-		"checks":   checks,
-		"comments": comments,
-		"reviews":  reviews,
-		"inline":   inline,
-	}
-	current := map[string]any{
-		"number":      pr["number"],
-		"title":       stringValue(pr["title"]),
-		"url":         stringValue(pr["url"]),
-		"fingerprint": fingerprint,
-	}
-	return normalizeMap(current)
-}
-
-func normalizeMap(value map[string]any) (map[string]any, error) {
-	data, err := jsonText(value, false)
-	if err != nil {
-		return nil, err
-	}
-	var normalized map[string]any
-	if err := decodeJSON(data, &normalized); err != nil {
-		return nil, err
-	}
-	return normalized, nil
-}
-
-func clip(body string) string {
-	body = strings.Join(strings.Fields(body), " ")
-	if strings.HasPrefix(body, "<!--") {
-		if index := strings.LastIndex(body, "-->"); index >= 0 {
-			body = strings.TrimSpace(body[index+3:])
-		}
-	}
-	runes := []rune(body)
-	if len(runes) <= bodyLimit {
-		return body
-	}
-	return strings.TrimRight(string(runes[:bodyLimit]), " \t\r\n") + "…"
-}
-
-func tallyPRChecks(checks []any) map[string]any {
-	failed := make([]string, 0)
-	pending, passed := 0, 0
-	for _, raw := range checks {
-		check := object(raw)
-		conclusion, status := text(check["conclusion"]), text(check["status"])
-		if status == "" {
-			status = text(check["state"])
-		}
-		name := text(check["name"])
-		if name == "" {
-			name = text(check["context"])
-		}
-		if name == "" {
-			name = "check"
-		}
-		if contains([]string{"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE"}, conclusion) || contains([]string{"FAILURE", "ERROR"}, status) {
-			failed = append(failed, name)
-		} else if contains([]string{"SUCCESS", "NEUTRAL", "SKIPPED"}, conclusion) || status == "SUCCESS" {
-			passed++
-		} else if status != "COMPLETED" && status != "" || conclusion == "" {
-			pending++
-		}
-	}
-	sort.Strings(failed)
-	unique := failed[:0]
-	for _, name := range failed {
-		if len(unique) == 0 || unique[len(unique)-1] != name {
-			unique = append(unique, name)
-		}
-	}
-	return map[string]any{"failed": unique, "pending": pending, "passed": passed}
-}
-
-func itemMap(items any) map[string]map[string]any {
-	result := make(map[string]map[string]any)
-	for _, raw := range list(items) {
-		item := object(raw)
-		if item["id"] != nil {
-			result[text(item["id"])] = item
-		}
-	}
-	return result
-}
-
-func describe(previous, current map[string]any) []string {
-	old, next := object(previous["fingerprint"]), object(current["fingerprint"])
-	lines := make([]string, 0)
-	if !reflect.DeepEqual(old["head"], next["head"]) {
-		head := text(next["head"])
-		if len(head) > 10 {
-			head = head[:10]
-		}
-		lines = append(lines, fmt.Sprintf("- Head moved to %s.", head))
-	}
-	if !reflect.DeepEqual(old["decision"], next["decision"]) || !reflect.DeepEqual(old["draft"], next["draft"]) {
-		decision := text(next["decision"])
-		if decision == "" {
-			decision = "none"
-		}
-		draft := ""
-		if next["draft"] == true {
-			draft = " draft"
-		}
-		lines = append(lines, fmt.Sprintf("- Review decision is now %s%s.", decision, draft))
-	}
-	oldChecks, newChecks := object(old["checks"]), object(next["checks"])
-	if !reflect.DeepEqual(oldChecks, newChecks) {
-		failed := list(newChecks["failed"])
-		failedNames := make([]string, 0, len(failed))
-		for _, name := range failed {
-			failedNames = append(failedNames, text(name))
-		}
-		failedText := strings.Join(failedNames, ", ")
-		if failedText == "" {
-			failedText = "none"
-		}
-		lines = append(lines, fmt.Sprintf("- CI: failed [%s]; pending %d; passed %d.", failedText, intValue(newChecks["pending"]), intValue(newChecks["passed"])))
-	}
-	for _, group := range []struct{ key, label string }{{"comments", "Comment"}, {"reviews", "Review"}, {"inline", "Inline comment"}} {
-		before, after := itemMap(old[group.key]), itemMap(next[group.key])
-		ids := make([]string, 0, len(after))
-		for id := range after {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		for _, id := range ids {
-			item := after[id]
-			if reflect.DeepEqual(before[id], item) {
-				continue
-			}
-			where := ""
-			if path := text(item["path"]); path != "" {
-				where = " on " + path
-			}
-			state := ""
-			if value := text(item["state"]); value != "" {
-				state = " (" + value + ")"
-			}
-			body := text(item["body"])
-			if body == "" {
-				body = "(no body)"
-			}
-			lines = append(lines, fmt.Sprintf("- %s from %s%s%s: %s", group.label, text(item["author"]), state, where, body))
-		}
-	}
-	return lines
 }
 
 func (w *watcher) busy(ctx context.Context, address string) bool {
@@ -451,12 +314,13 @@ func (w *watcher) busy(ctx context.Context, address string) bool {
 	if err != nil {
 		return true
 	}
-	var response map[string]any
+	var response struct {
+		Status string `json:"status"`
+	}
 	if decodeJSON(stdout, &response) != nil {
 		return false
 	}
-	status := text(response["status"])
-	return status == "working" || status == "blocked"
+	return response.Status == "working" || response.Status == "blocked"
 }
 
 func (w *watcher) deliver(ctx context.Context, address, message string) bool {
@@ -477,6 +341,374 @@ func (w *watcher) deliver(ctx context.Context, address, message string) bool {
 	return false
 }
 
-func makeMessage(current map[string]any, lines []string) string {
-	return fmt.Sprintf("PR #%s update: %s\n%s\n%s\nHandle this only on this branch. Do not start other agents. If it needs no code or reply change, stop without extra work.", text(current["number"]), text(current["title"]), text(current["url"]), strings.Join(lines, "\n"))
+// ---------- GitHub data (SDK) ----------
+
+func (w *watcher) openPRs(ctx context.Context) (map[string]*github.PullRequest, error) {
+	prs, err := listPRsByAuthor(ctx, w.gh, w.owner, w.repo, w.username, "open", 40)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]*github.PullRequest, len(prs))
+	for _, pr := range prs {
+		result[pr.GetHead().GetRef()] = pr
+	}
+	return result, nil
+}
+
+func (w *watcher) snapshot(ctx context.Context, number int) (*prSnapshot, error) {
+	pr, _, err := w.gh.PullRequests.Get(ctx, w.owner, w.repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("get PR #%d: %w", number, err)
+	}
+
+	// Conversation comments.
+	issueComments := paginate(func(opts *github.ListOptions) ([]*github.IssueComment, *github.Response, error) {
+		return w.gh.Issues.ListComments(ctx, w.owner, w.repo, number, &github.IssueListCommentsOptions{ListOptions: *opts})
+	})
+	comments := make([]noteRecord, 0, len(issueComments))
+	for _, c := range issueComments {
+		if isAgentComment(c.GetBody()) {
+			continue
+		}
+		comments = append(comments, noteRecord{
+			ID: fmt.Sprint(c.GetID()), Author: loginOrUnknown(c.GetUser()),
+			At: formatTimestamp(c.UpdatedAt), Body: clip(c.GetBody()),
+		})
+	}
+
+	// Reviews.
+	prReviews := paginate(func(opts *github.ListOptions) ([]*github.PullRequestReview, *github.Response, error) {
+		return w.gh.PullRequests.ListReviews(ctx, w.owner, w.repo, number, opts)
+	})
+	reviews := make([]noteRecord, 0, len(prReviews))
+	for _, r := range prReviews {
+		reviews = append(reviews, noteRecord{
+			ID: fmt.Sprint(r.GetID()), Author: loginOrUnknown(r.GetUser()),
+			State: r.GetState(), At: formatTimestamp(r.SubmittedAt),
+			Body: clip(r.GetBody()),
+		})
+	}
+
+	// Inline review comments (paginated).
+	prComments := paginate(func(opts *github.ListOptions) ([]*github.PullRequestComment, *github.Response, error) {
+		return w.gh.PullRequests.ListComments(ctx, w.owner, w.repo, number, &github.PullRequestListCommentsOptions{ListOptions: *opts})
+	})
+	inline := make([]noteRecord, 0, len(prComments))
+	for _, c := range prComments {
+		if isAgentComment(c.GetBody()) {
+			continue
+		}
+		inline = append(inline, noteRecord{
+			ID: fmt.Sprint(c.GetID()), Author: loginOrUnknown(c.GetUser()),
+			At: formatTimestamp(c.UpdatedAt), Path: c.GetPath(),
+			Body: clip(c.GetBody()),
+		})
+	}
+
+	// CI.
+	ref := pr.GetHead().GetSHA()
+	ci := fetchCI(ctx, w.gh, w.owner, w.repo, ref)
+
+	// Review decision (approximated).
+	decision := computeDecision(prReviews)
+
+	state := prStateName(pr)
+	mergeable := pr.GetMergeableState()
+	if mergeable == "" {
+		mergeable = "unknown"
+	}
+
+	return &prSnapshot{
+		Number: pr.GetNumber(),
+		Title:  pr.GetTitle(),
+		URL:    pr.GetHTMLURL(),
+		Fingerprint: snapshotFP{
+			Head: pr.GetHead().GetSHA(), State: state, Mergeable: mergeable,
+			Decision: decision, Draft: pr.GetDraft(),
+			Checks:   ciDetail{Failed: ci.FailedNames, Pending: ci.Pending, Passed: ci.Passed},
+			Comments: comments, Reviews: reviews, Inline: inline,
+		},
+	}, nil
+}
+
+// paginate collects all pages from a GitHub list endpoint.
+func paginate[T any](fn func(opts *github.ListOptions) ([]T, *github.Response, error)) []T {
+	var all []T
+	opts := &github.ListOptions{PerPage: 100}
+	for {
+		items, resp, err := fn(opts)
+		if err != nil || len(items) == 0 {
+			break
+		}
+		all = append(all, items...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return all
+}
+
+func loginOrUnknown(u *github.User) string {
+	if login := u.GetLogin(); login != "" {
+		return login
+	}
+	return "unknown"
+}
+
+// ---------- snapshot diff ----------
+
+// isAgentComment returns true if the body was posted by this agent.
+func isAgentComment(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	return strings.HasPrefix(trimmed, "[Herdr]:")
+}
+
+func clip(body string) string {
+	body = strings.Join(strings.Fields(body), " ")
+	if strings.HasPrefix(body, "<!--") {
+		if index := strings.LastIndex(body, "-->"); index >= 0 {
+			body = strings.TrimSpace(body[index+3:])
+		}
+	}
+	runes := []rune(body)
+	if len(runes) <= bodyLimit {
+		return body
+	}
+	return strings.TrimRight(string(runes[:bodyLimit]), " \t\r\n") + "…"
+}
+
+func noteMap(items []noteRecord) map[string]noteRecord {
+	m := make(map[string]noteRecord, len(items))
+	for _, item := range items {
+		m[item.ID] = item
+	}
+	return m
+}
+
+func describe(previous, current *prSnapshot) []string {
+	if previous == nil || current == nil {
+		return nil
+	}
+	old, next := &previous.Fingerprint, &current.Fingerprint
+	var lines []string
+
+	// Merge / close / reopen detection.
+	if old.State != next.State {
+		switch next.State {
+		case "MERGED":
+			lines = append(lines, "- PR was merged.")
+		case "CLOSED":
+			lines = append(lines, "- PR was closed without merging.")
+		case "OPEN":
+			if old.State == "CLOSED" {
+				lines = append(lines, "- PR was reopened.")
+			}
+		}
+	}
+
+	// Mergeable status change.
+	if old.Mergeable != next.Mergeable && next.Mergeable != "unknown" {
+		lines = append(lines, fmt.Sprintf("- Mergeable status changed to %s.", next.Mergeable))
+	}
+
+	if old.Head != next.Head {
+		head := next.Head
+		if len(head) > 10 {
+			head = head[:10]
+		}
+		lines = append(lines, fmt.Sprintf("- Head moved to %s.", head))
+	}
+
+	if old.Decision != next.Decision || old.Draft != next.Draft {
+		decision := next.Decision
+		if decision == "" {
+			decision = "none"
+		}
+		draft := ""
+		if next.Draft {
+			draft = " draft"
+		}
+		lines = append(lines, fmt.Sprintf("- Review decision is now %s%s.", decision, draft))
+	}
+
+	if !reflect.DeepEqual(old.Checks, next.Checks) {
+		failedText := strings.Join(next.Checks.Failed, ", ")
+		if failedText == "" {
+			failedText = "none"
+		}
+		lines = append(lines, fmt.Sprintf("- CI: failed [%s]; pending %d; passed %d.",
+			failedText, next.Checks.Pending, next.Checks.Passed))
+	}
+
+	for _, group := range []struct {
+		label string
+		old   []noteRecord
+		next  []noteRecord
+	}{
+		{"Comment", old.Comments, next.Comments},
+		{"Review", old.Reviews, next.Reviews},
+		{"Inline comment", old.Inline, next.Inline},
+	} {
+		before := noteMap(group.old)
+		for _, item := range group.next {
+			if prev, exists := before[item.ID]; exists && reflect.DeepEqual(prev, item) {
+				continue
+			}
+			where := ""
+			if item.Path != "" {
+				where = " on " + item.Path
+			}
+			state := ""
+			if item.State != "" {
+				state = " (" + item.State + ")"
+			}
+			body := item.Body
+			if body == "" {
+				body = "(no body)"
+			}
+			lines = append(lines, fmt.Sprintf("- %s from %s%s%s: %s",
+				group.label, item.Author, state, where, body))
+		}
+	}
+	return lines
+}
+
+func makeMessage(current *prSnapshot, lines []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## PR #%d update: %s\n%s\n\n", current.Number, current.Title, current.URL)
+
+	// Categorise diff lines into buckets for actionable prompts.
+	var (
+		stateLine    []string // merged, closed, reopened
+		mergeable    []string
+		commitLines  []string
+		decisionLine []string
+		ciLines      []string
+		reviews      []string
+		comments     []string
+		inline       []string
+	)
+	for _, line := range lines {
+		switch {
+		case strings.Contains(line, "PR was merged"), strings.Contains(line, "PR was closed"), strings.Contains(line, "PR was reopened"):
+			stateLine = append(stateLine, line)
+		case strings.Contains(line, "Mergeable status"):
+			mergeable = append(mergeable, line)
+		case strings.Contains(line, "Head moved"):
+			commitLines = append(commitLines, line)
+		case strings.Contains(line, "Review decision"):
+			decisionLine = append(decisionLine, line)
+		case strings.HasPrefix(line, "- CI:"):
+			ciLines = append(ciLines, line)
+		case strings.HasPrefix(line, "- Review from"):
+			reviews = append(reviews, line)
+		case strings.HasPrefix(line, "- Inline comment"):
+			inline = append(inline, line)
+		case strings.HasPrefix(line, "- Comment from"):
+			comments = append(comments, line)
+		default:
+			comments = append(comments, line)
+		}
+	}
+
+	// Emit sections with action instructions.
+	if len(stateLine) > 0 {
+		for _, l := range stateLine {
+			switch {
+			case strings.Contains(l, "merged"):
+				fmt.Fprintf(&b, "### ✅ PR Merged\n%s\n→ PR is already merged. No further action needed.\n\n", l)
+			case strings.Contains(l, "closed"):
+				fmt.Fprintf(&b, "### 🚫 PR Closed\n%s\n→ No action needed unless you want to reopen.\n\n", l)
+			case strings.Contains(l, "reopened"):
+				fmt.Fprintf(&b, "### 🔄 PR Reopened\n%s\n→ Check outstanding review comments and CI status.\n\n", l)
+			}
+		}
+	}
+
+	if len(ciLines) > 0 {
+		fp := &current.Fingerprint
+		if len(fp.Checks.Failed) > 0 {
+			fmt.Fprintf(&b, "### 🔴 CI Failed\n%s\n→ Run `gh pr checks %d` to identify failures. Read the logs, diagnose and fix.\n\n",
+				strings.Join(ciLines, "\n"), current.Number)
+		} else if fp.Checks.Pending > 0 {
+			fmt.Fprintf(&b, "### ⏳ CI Pending\n%s\n→ Checks are still running. Wait for results.\n\n", strings.Join(ciLines, "\n"))
+		} else {
+			fmt.Fprintf(&b, "### ✅ CI Passed\n%s\n→ All checks green. If reviews are also approved, ask the user whether to merge.\n\n", strings.Join(ciLines, "\n"))
+		}
+	}
+
+	if len(reviews) > 0 {
+		for _, r := range reviews {
+			switch {
+			case strings.Contains(r, "CHANGES_REQUESTED"):
+				fmt.Fprintf(&b, "### ❌ Changes Requested\n%s\n→ Read each review comment carefully. Address the feedback, push fixes.\n\n", r)
+			case strings.Contains(r, "APPROVED"):
+				fmt.Fprintf(&b, "### ✅ Review Approved\n%s\n→ Check if all required reviews are met and CI is green — if so, ask the user whether to merge.\n\n", r)
+			default:
+				fmt.Fprintf(&b, "### 💬 Review Comment\n%s\n→ Read the review and determine if action is needed.\n\n", r)
+			}
+		}
+	}
+
+	if len(inline) > 0 {
+		fmt.Fprintf(&b, "### 💬 Inline Review Comments\n")
+		for _, l := range inline {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
+		fmt.Fprintf(&b, "→ Read each comment in context of the file. Fix or respond to each one.\n\n")
+	}
+
+	if len(comments) > 0 {
+		fmt.Fprintf(&b, "### 💬 PR Comments\n")
+		for _, l := range comments {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
+		fmt.Fprintf(&b, "→ Determine if any comment requires a code change or reply.\n\n")
+	}
+
+	if len(commitLines) > 0 {
+		fmt.Fprintf(&b, "### 🔨 New Commits\n%s\n→ Check if this resolves outstanding review comments.\n\n", strings.Join(commitLines, "\n"))
+	}
+
+	if len(decisionLine) > 0 {
+		for _, l := range decisionLine {
+			switch {
+			case strings.Contains(l, "APPROVED"):
+				fmt.Fprintf(&b, "### ✅ All Reviews Approved\n%s\n→ If CI is green, ask the user whether to merge.\n\n", l)
+			case strings.Contains(l, "CHANGES_REQUESTED"):
+				fmt.Fprintf(&b, "### ❌ Changes Requested\n%s\n→ Address all review feedback before proceeding.\n\n", l)
+			default:
+				fmt.Fprintf(&b, "### 📋 Review Status\n%s\n\n", l)
+			}
+		}
+	}
+
+	if len(mergeable) > 0 {
+		for _, l := range mergeable {
+			if strings.Contains(l, "dirty") || strings.Contains(l, "behind") {
+				fmt.Fprintf(&b, "### ⚠️ Merge Conflict\n%s\n→ Rebase or merge the base branch to resolve conflicts.\n\n", l)
+			} else {
+				fmt.Fprintf(&b, "### 📋 Mergeable Status\n%s\n\n", l)
+			}
+		}
+	}
+
+	// Current state summary.
+	fp := &current.Fingerprint
+	failedNames := "none"
+	if len(fp.Checks.Failed) > 0 {
+		failedNames = strings.Join(fp.Checks.Failed, ", ")
+	}
+	head := fp.Head
+	if len(head) > 10 {
+		head = head[:10]
+	}
+	fmt.Fprintf(&b, "---\n**Current state**: %s | review=%s | CI: failed=[%s] pending=%d passed=%d | mergeable=%s | head=%s\n\n",
+		fp.State, fp.Decision, failedNames, fp.Checks.Pending, fp.Checks.Passed, fp.Mergeable, head)
+
+	b.WriteString("When posting PR comments or replies, prefix with `[Herdr]:` followed by a newline, then the markdown body. This identifies messages as agent-authored so they are not re-processed. Use markdown formatting for all comments and responses (GitHub supports it).\n\n")
+	b.WriteString("Handle this only on this branch. Do not start other agents. If it needs no code or reply change, stop without extra work.")
+
+	return b.String()
 }

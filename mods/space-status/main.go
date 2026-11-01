@@ -35,12 +35,15 @@ func main() {
 
 func usage(exitCode int) {
 	fmt.Fprintln(os.Stderr, `Usage:
-  space-status refresh [--repo PATH] [--output PATH] [--once]
-  space-status pr-watch [--repo PATH] [--github-repo OWNER/NAME] [--state PATH] [--skip ADDRESS ...]
+  space-status refresh [--repo PATH] [--output PATH] [--token TOKEN] [--once]
+  space-status pr-watch [--repo PATH] [--github-repo OWNER/NAME] [--token TOKEN] [--state PATH] [--skip ADDRESS ...]
 
 Commands:
   refresh   Write PR and CI status for the repository and its worktrees.
-  pr-watch  Poll open PRs and forward new updates to matching live Pi agents.`)
+  pr-watch  Poll open PRs and forward new updates to matching live Pi agents.
+
+Authentication:
+  Set GITHUB_TOKEN or pass --token on each subcommand.`)
 	os.Exit(exitCode)
 }
 

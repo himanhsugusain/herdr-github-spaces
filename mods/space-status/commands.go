@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const commandTimeout = 45 * time.Second
+
 func command(ctx context.Context, cwd string, timeout time.Duration, args ...string) ([]byte, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -68,8 +70,8 @@ func jsonText(value any, pretty bool) ([]byte, error) {
 		return nil, err
 	}
 	data := bytes.TrimSuffix(buffer.Bytes(), []byte("\n"))
-	data = bytes.ReplaceAll(data, []byte(`\u2028`), []byte(" "))
-	data = bytes.ReplaceAll(data, []byte(`\u2029`), []byte(" "))
+	data = bytes.ReplaceAll(data, []byte(`\u2028`), []byte(" "))
+	data = bytes.ReplaceAll(data, []byte(`\u2029`), []byte(" "))
 	return data, nil
 }
 
@@ -110,44 +112,4 @@ func absolutePath(path string) (string, error) {
 		}
 	}
 	return filepath.Abs(path)
-}
-
-func object(value any) map[string]any {
-	if result, ok := value.(map[string]any); ok && result != nil {
-		return result
-	}
-	return map[string]any{}
-}
-
-func text(value any) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprint(value)
-}
-
-func intValue(value any) int {
-	switch number := value.(type) {
-	case json.Number:
-		parsed, _ := number.Int64()
-		return int(parsed)
-	case float64:
-		return int(number)
-	case int:
-		return number
-	default:
-		return 0
-	}
-}
-
-func stringValue(value any) string {
-	if value == nil {
-		return ""
-	}
-	return text(value)
-}
-
-func list(value any) []any {
-	items, _ := value.([]any)
-	return items
 }
