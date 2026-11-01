@@ -344,7 +344,10 @@ func (w *watcher) deliver(ctx context.Context, address, message string) bool {
 // ---------- GitHub data (SDK) ----------
 
 func (w *watcher) openPRs(ctx context.Context) (map[string]*github.PullRequest, error) {
-	prs, err := listPRsByAuthor(ctx, w.gh, w.owner, w.repo, w.username, "open", 40)
+	// Include recently closed and merged PRs as well as open ones. Otherwise a
+	// state transition out of OPEN disappears from this list before snapshot()
+	// can observe it and emit the close/merge event.
+	prs, err := listPRsByAuthor(ctx, w.gh, w.owner, w.repo, w.username, "all", 40)
 	if err != nil {
 		return nil, err
 	}
