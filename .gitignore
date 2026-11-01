@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.error
 mods/space-status/status.json
+mods/space-status/space-status
+mods/space-status/space-status.exe
 mods/space-status/.status-*
 mods/*/jsconfig.json
 mods/*/*.d.ts

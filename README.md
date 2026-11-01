@@ -8,7 +8,7 @@ Read [RECIPE.md](RECIPE.md) for the complete rebuild brief, behaviors, dependenc
 
 ## Install
 
-Requires Herdr; validated with 0.1.9. Read your `~/.config/herdr-app/AGENTS.md` and the recipe first. Both lists read an optional local PR status file; agent-attention counts use Herdr's live data. The optional Python helper runs Git and authenticated GitHub CLI queries. Herdr's Files/Changes panels read working folders, and Changes can stage and commit changes when requested.
+Requires Herdr; validated with 0.1.9. Read your `~/.config/herdr-app/AGENTS.md` and the recipe first. Both lists read an optional local PR status file; agent-attention counts use Herdr's live data. The optional Go helper runs Git and authenticated GitHub CLI queries. Herdr's Files/Changes panels read working folders, and Changes can stage and commit changes when requested.
 
 Copy `layouts/github-spaces.json` into your Herdr `layouts/` directory and the three directories under `mods/` into its `mods/` directory. Keep the `space-status` directory even if the helper is unused. The built-in chrome, tabs, pane header, panels, menus, and icons come from your installed Herdr.
 
@@ -22,12 +22,14 @@ herdr-app check ~/.config/herdr-app/mods/agents-space
 herdr-app do layout.switch '{"name":"github-spaces"}'
 ```
 
-For live PR/CI badges, authenticate `gh` and explicitly run:
+For live PR/CI badges, install Go 1.27 or newer, authenticate `gh`, and build the helper once:
 
 ```sh
-python3 ~/.config/herdr-app/mods/space-status/refresh.py --repo /path/to/your/repository
+cd ~/.config/herdr-app/mods/space-status
+go build -o space-status .
+./space-status refresh --repo /path/to/your/repository
 ```
 
-This stays in the foreground. Stop it with Ctrl-C. It monitors one repository and its local worktrees; no background service is installed. Without it, the layout still shows normal agent titles and activity. The recipe documents the PR/query limits and the collapsed-sidebar limitation.
+The helper uses only Go's standard library; GitHub and Herdr access go through the installed `gh`, `git`, and (for PR notifications) `hc` CLIs. `refresh` stays in the foreground and can be stopped with Ctrl-C. It monitors one repository and its local worktrees; no background service is installed. To watch open PRs and forward updates to matching live Pi agents, run `./space-status pr-watch --repo /path/to/your/repository` in another terminal. Without either process, the layout still shows normal agent titles and activity. The recipe documents the PR/query limits and the collapsed-sidebar limitation.
 
 The layout uses Herdr's shipped chrome and panels. The custom mods contain only the space/agent list behavior described in the recipe. The agent mod bundles its glyph font and license.

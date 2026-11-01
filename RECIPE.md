@@ -74,13 +74,17 @@ Set `traffic_lights: [12,16]`, `terminal_padding: [14,12]`, and the pane header 
 
 Shipped controls call `tab.select/new/rename/move/close/prev/next`, `pane.focus/split/zoom/close`, `layout.resize/select/show/hide`, `app.settings`, `app.palette`, `mod.open`, and native window commands. They use `layout()`, `window()`, `props()`, `settings()`, `shared()/setShared()`, `openOverlay()`, and per-copy `localStorage` for layout context and preferences. File and change panels additionally run local or remote `sh`/PowerShell and Git commands via `exec()`, read the focused working directory, and watch local folders. The Changes commit button runs `git add -A` followed by `git commit -m`.
 
-**Optional PR helper:** include `mods/space-status/refresh.py` as a Python helper folder, not a renderable mod. Require Python 3.9+, Git, and authenticated `gh`. After installing, start it explicitly:
+**Optional PR helpers:** include `mods/space-status/` as a Go helper folder, not a renderable mod. Build once with Go 1.27+ (the program uses only the standard library); runtime dependencies are Git and authenticated `gh` for status refresh, plus `hc` for notifications. From the installed helper folder:
 
 ```sh
-python3 ~/.config/herdr-app/mods/space-status/refresh.py --repo /path/to/your/repository
+cd ~/.config/herdr-app/mods/space-status
+go build -o space-status .
+./space-status refresh --repo /path/to/your/repository
 ```
 
-It runs Git worktree/branch queries, lists up to 40 open PRs plus the latest 100 PRs of any state authored by the authenticated user using `gh pr list`, resolves the repository using `gh repo view`, then queries the last commit's first 100 check contexts through `gh api graphql`. Open PRs take precedence when a branch name has been reused; otherwise the newest listed PR for the branch wins. If the history query fails, open PRs remain available. It collects the branch keys, repository, PR state/number, and CI counts consumed by both lists. It refreshes every 60 seconds after each pass and writes only when content changes, atomically beside the script. `--once` runs one pass; `--output /path/status.json` is useful for testing. It has no agent-messaging behavior and does not start itself when Herdr opens.
+`refresh` runs Git worktree/branch queries, lists up to 40 open PRs plus the latest 100 PRs of any state authored by the authenticated user using `gh pr list`, resolves the repository using `gh repo view`, then queries the last commit's first 100 check contexts through `gh api graphql`. Open PRs take precedence when a branch name has been reused; otherwise the newest listed PR for the branch wins. If the history query fails, open PRs remain available. It collects the branch keys, repository, PR state/number, and CI counts consumed by both lists. It refreshes every 60 seconds after each pass and writes only when content changes, atomically beside the binary. `--once` runs one pass; `--output /path/status.json` is useful for testing. It does not start itself when Herdr opens.
+
+The same binary also preserves the PR notification watcher: run `./space-status pr-watch --repo /path/to/your/repository` to poll open PRs and forward updates to matching live Pi agents. It infers `OWNER/NAME` with `gh repo view`; `--github-repo OWNER/NAME`, `--state PATH`, and repeatable `--skip ADDRESS` options are available. It uses `hc ls/get/send` and stores state under `~/.config/herdr-app/mods/space-status/pr_watch_state.json` by default. It does not start itself when Herdr opens.
 
 The status format is `{"prs": {...}}`. Keys are compact JSON strings of `[machine,cwd,branch]`, with local machine represented by `null`. A PR value contains `repository` (`owner/name`), `number`, `state`, `isDraft`, `failed`, `pending`, `passed`, `skipped`, and `total`, or is `null` when unmatched. Use JSON stringification without spaces, preserving Unicode exactly as JavaScript does. Both list mods read `~/.config/herdr-app/mods/space-status/status.json`; the helper produces local-machine keys only.
 
